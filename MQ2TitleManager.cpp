@@ -3,6 +3,9 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <mutex>
+
+static std::mutex s_titlesMutex;
 
 PreSetup("MQ2TitleManager");
 PLUGIN_VERSION(1.0);
@@ -35,6 +38,9 @@ static bool                    s_titlesReady = false;
 static bool                    s_windowOpen = false;
 static UdpConnection* s_pConnection = nullptr;
 static char                    s_filterBuf[128] = {};
+enum class TitleSortMode { Name, ID, Length };
+static TitleSortMode s_sortMode = TitleSortMode::Name;
+static bool s_pendingTitlesRequest = false;
 
 //----------------------------------------------------------------------------
 // Outbound packet helpers
@@ -60,6 +66,12 @@ static void SendToServer(uint32_t opcode, const void* payload, int payloadLen)
 
 static void SendRequestTitles()
 {
+	if (!s_pConnection)
+	{
+		s_pendingTitlesRequest = true;
+		WriteChatf("\ay[MQ2Titles]\ax No connection yet — will request titles automatically when connected.");
+		return;
+	}
 	SendToServer(OP_RequestTitles, nullptr, 0);
 }
 
@@ -95,7 +107,9 @@ static DWORD s_appliedMsgExpiry = 0;
 
 static void SyncSelectionsToCurrentTitles()
 {
-	s_selectedPrefixIdx = -1;  // default to (None)
+	std::lock_guard<std::mutex> lock(s_titlesMutex);
+
+	s_selectedPrefixIdx = -1;
 	s_selectedSuffixIdx = -1;
 
 	if (!pLocalPlayer) return;
@@ -125,7 +139,7 @@ static void DrawTitlesWindow()
 		s_showAppliedMsg = false;
 
 	ImGui::SetNextWindowSize(ImVec2(540, 500), ImGuiCond_FirstUseEver);
-	if (!ImGui::Begin("Title Browser", &s_windowOpen))
+	if (!ImGui::Begin("MQ Title Manager", &s_windowOpen))
 	{
 		ImGui::End();
 		return;
@@ -171,20 +185,13 @@ static void DrawTitlesWindow()
 	ImGui::Separator();
 
 	// Buttons row
-	if (ImGui::Button("Refresh"))
-	{
-		s_titlesReady = false;
-		s_selectionDirty = false;
-		s_showAppliedMsg = false;
-		s_titles.clear();
-		SendRequestTitles();
-	}
-
-	ImGui::SameLine();
-
+// Apply Changes
 	const bool applyDisabled = !s_selectionDirty;
 	if (applyDisabled) ImGui::BeginDisabled();
 
+	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.5f, 0.15f, 1.0f));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.7f, 0.2f, 1.0f));
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.1f, 0.4f, 0.1f, 1.0f));
 	if (ImGui::Button("Apply Changes"))
 	{
 		if (s_pConnection)
@@ -206,22 +213,63 @@ static void DrawTitlesWindow()
 			s_appliedMsgExpiry = GetTickCount() + 2000;
 		}
 	}
+	ImGui::PopStyleColor(3);
 
 	if (applyDisabled) ImGui::EndDisabled();
 
 	ImGui::SameLine();
 
+	// Cancel
 	if (s_selectionDirty)
 	{
 		if (ImGui::Button("Cancel"))
-		{
 			SyncSelectionsToCurrentTitles();
-		}
 		ImGui::SameLine();
 	}
 
+	// Clear All
+	ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.1f, 0.1f, 1.0f));
+	ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.15f, 0.15f, 1.0f));
+	ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.5f, 0.05f, 0.05f, 1.0f));
+	if (ImGui::Button("Clear Current Title"))
+	{
+		if (s_pConnection)
+		{
+			SendSetTitle(0, false);
+			SendSetTitle(0, true);
+
+			s_selectedPrefixIdx = -1;
+			s_selectedSuffixIdx = -1;
+			s_selectionDirty = false;
+			s_showAppliedMsg = true;
+			s_appliedMsgExpiry = GetTickCount() + 2000;
+		}
+	}
+	ImGui::PopStyleColor(3);
+
+	ImGui::SameLine();
+
+	// Refresh pushed to the right
+	const float refreshWidth = ImGui::CalcTextSize("Refresh").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+	const float availableWidth = ImGui::GetContentRegionAvail().x;
+	ImGui::SetCursorPosX(ImGui::GetCursorPosX() + availableWidth - refreshWidth);
+
+	if (ImGui::Button("Refresh"))
+	{
+		s_titlesReady = false;
+		s_selectionDirty = false;
+		s_showAppliedMsg = false;
+		s_titles.clear();
+		SendRequestTitles();
+	}
+
 	if (!s_titlesReady)
-		ImGui::TextDisabled("Waiting for server...");
+	{
+		if (s_pendingTitlesRequest)
+			ImGui::TextDisabled("Waiting for connection...");
+		else
+			ImGui::TextDisabled("Waiting for server...");
+	}
 	else
 		ImGui::Text("%d titles", (int)s_titles.size());
 
@@ -229,13 +277,33 @@ static void DrawTitlesWindow()
 
 	// Two filter boxes side by side
 	ImGui::Columns(2, "filtercols", false);
-	ImGui::SetNextItemWidth(-1);
+
+	ImGui::SetNextItemWidth(-28);  // leave room for X button
 	ImGui::InputText("##prefixfilter", s_prefixFilterBuf, sizeof(s_prefixFilterBuf));
+	ImGui::SameLine();
+	if (ImGui::Button("X##cpf"))
+		memset(s_prefixFilterBuf, 0, sizeof(s_prefixFilterBuf));
+
 	ImGui::NextColumn();
-	ImGui::SetNextItemWidth(-1);
+
+	ImGui::SetNextItemWidth(-28);  // leave room for X button
 	ImGui::InputText("##suffixfilter", s_suffixFilterBuf, sizeof(s_suffixFilterBuf));
+	ImGui::SameLine();
+	if (ImGui::Button("X##csf"))
+		memset(s_suffixFilterBuf, 0, sizeof(s_suffixFilterBuf));
+
 	ImGui::NextColumn();
 	ImGui::Columns(1);
+
+	// Sort dropdown
+	ImGui::AlignTextToFramePadding();
+	ImGui::TextUnformatted("Sort by:");
+	ImGui::SameLine();
+	ImGui::SetNextItemWidth(120);
+	const char* sortItems[] = { "Name", "ID", "Length" };
+	int sortCurrent = static_cast<int>(s_sortMode);
+	if (ImGui::Combo("##sort", &sortCurrent, sortItems, IM_ARRAYSIZE(sortItems)))
+		s_sortMode = static_cast<TitleSortMode>(sortCurrent);
 
 	ImGui::Separator();
 
@@ -256,6 +324,8 @@ static void DrawTitlesWindow()
 	const std::string prefixFilter = makeFilter(s_prefixFilterBuf);
 	const std::string suffixFilter = makeFilter(s_suffixFilterBuf);
 
+	std::lock_guard<std::mutex> lock(s_titlesMutex);
+
 	std::vector<int> prefixIndices, suffixIndices;
 	for (int i = 0; i < (int)s_titles.size(); i++)
 	{
@@ -264,6 +334,46 @@ static void DrawTitlesWindow()
 		if (!s_titles[i].suffix.empty() && matches(s_titles[i].suffix, suffixFilter))
 			suffixIndices.push_back(i);
 	}
+
+	// Sort both lists by the same mode
+	auto prefixSorter = [&](int a, int b) -> bool {
+		const std::string& sa = s_titles[a].prefix;
+		const std::string& sb = s_titles[b].prefix;
+		switch (s_sortMode)
+		{
+		case TitleSortMode::ID:     return s_titles[a].id < s_titles[b].id;
+		case TitleSortMode::Length: return sa.length() > sb.length();
+		case TitleSortMode::Name:
+		default:
+		{
+			std::string la = sa, lb = sb;
+			std::transform(la.begin(), la.end(), la.begin(), ::tolower);
+			std::transform(lb.begin(), lb.end(), lb.begin(), ::tolower);
+			return la < lb;
+		}
+		}
+		};
+
+	auto suffixSorter = [&](int a, int b) -> bool {
+		const std::string& sa = s_titles[a].suffix;
+		const std::string& sb = s_titles[b].suffix;
+		switch (s_sortMode)
+		{
+		case TitleSortMode::ID:     return s_titles[a].id < s_titles[b].id;
+		case TitleSortMode::Length: return sa.length() > sb.length();
+		case TitleSortMode::Name:
+		default:
+		{
+			std::string la = sa, lb = sb;
+			std::transform(la.begin(), la.end(), la.begin(), ::tolower);
+			std::transform(lb.begin(), lb.end(), lb.begin(), ::tolower);
+			return la < lb;
+		}
+		}
+		};
+
+	std::sort(prefixIndices.begin(), prefixIndices.end(), prefixSorter);
+	std::sort(suffixIndices.begin(), suffixIndices.end(), suffixSorter);
 
 	// Column headers
 	ImGui::Columns(2, "titlecols");
@@ -357,7 +467,7 @@ static void Cmd_Titles(PlayerClient* /*pChar*/, const char* /*szLine*/)
 	{
 		s_showAppliedMsg = false;
 		if (!s_titlesReady)
-			SendRequestTitles();
+			SendRequestTitles();  // will queue if no connection yet
 		else
 			SyncSelectionsToCurrentTitles();
 	}
@@ -368,7 +478,7 @@ static void Cmd_Titles(PlayerClient* /*pChar*/, const char* /*szLine*/)
 //----------------------------------------------------------------------------
 static void ParseTitleList(const char* data, uint32_t length)
 {
-	s_titles.clear();
+	std::vector<TitleEntry> newTitles;
 
 	const uint8_t* p = reinterpret_cast<const uint8_t*>(data);
 	const uint8_t* end = p + length;
@@ -403,12 +513,18 @@ static void ParseTitleList(const char* data, uint32_t length)
 		e.suffix = s;
 		p += len + 1;
 
-		s_titles.push_back(std::move(e));
+		newTitles.push_back(std::move(e));
 	}
 
-	s_titlesReady = true;
-	SyncSelectionsToCurrentTitles();  // sync now that we have the list
-	WriteChatf("\ay[MQ2TitleManager]\ax Loaded %d titles.", (int)s_titles.size());
+	// Only lock for the swap
+	{
+		std::lock_guard<std::mutex> lock(s_titlesMutex);
+		s_titles = std::move(newTitles);
+		s_titlesReady = true;
+	}
+
+	SyncSelectionsToCurrentTitles();
+	WriteChatf("\ay[MQ2Titles]\ax Loaded %d titles.", (int)s_titles.size());
 }
 
 //----------------------------------------------------------------------------
@@ -425,19 +541,24 @@ DETOUR_TRAMPOLINE_DEF(unsigned char __fastcall, HandleWorldMessage_Trampoline,
 		char* data,
 		uint32_t       length)
 {
-	// Capture connection pointer
 	if (pConn && !s_pConnection)
 	{
 		s_pConnection = pConn;
+		WriteChatf("\ay[MQ2Titles]\ax Connection captured.");
+
+		// Fire any pending request immediately
+		if (s_pendingTitlesRequest)
+		{
+			s_pendingTitlesRequest = false;
+			SendRequestTitles();
+		}
 	}
 
-	// Intercept title list
 	if (opcode == OP_SendTitleList && data && length > 0)
 		ParseTitleList(data, length);
 
 	return HandleWorldMessage_Trampoline(pThis, edx, pConn, opcode, data, length);
 }
-
 //----------------------------------------------------------------------------
 // Plugin lifecycle
 //----------------------------------------------------------------------------
@@ -474,8 +595,12 @@ PLUGIN_API void OnUpdateImGui()
 
 PLUGIN_API void OnZoned()
 {
-	// Connection pointer may change on zone — re-capture on next packet
 	s_pConnection = nullptr;
 	s_titlesReady = false;
+	s_pendingTitlesRequest = false;
 	s_titles.clear();
+
+	// Re-queue if window is open
+	if (s_windowOpen)
+		SendRequestTitles();
 }
